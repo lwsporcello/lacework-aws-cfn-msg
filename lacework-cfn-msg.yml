@@ -1,0 +1,376 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "Lacework CloudFormation automation deployment"
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Configuration"
+        Parameters:
+          - LaceworkURL
+          - LaceworkAccessKeyID
+          - LaceworkSecretKey
+      - Label:
+          default: "Advanced Configuration"
+        Parameters:
+          - S3BucketName
+          - S3KeyPrefix
+    ParameterLabels:
+      LaceworkURL:
+        default: Lacework URL
+      LaceworkAccessKeyID:
+        default: Lacework Access Key ID
+      LaceworkSecretKey:
+        default: Lacework Secret Key
+      S3BucketName:
+        default: CloudFormation S3 Bucket
+      S3KeyPrefix:
+        default: CloudFormation S3 Key Prefix
+
+Parameters:
+  LaceworkURL:
+    Default: "msg.lacework.net"
+    Type: String
+    Description: Lacework URL
+    MinLength: "1"
+  LaceworkAccessKeyID:
+    Default: "<Your API Key ID>"
+    Type: String
+    MinLength: "1"
+  LaceworkSecretKey:
+    Default: "<Your API Key Secret>"
+    Type: String
+    MinLength: "1"
+
+  # advanced
+  S3BucketName:
+    Type: String
+    Default: lacework-setup-msg
+    MinLength: "1"
+    Description: "S3 bucket for assets. Use this if you want to customize your deployment. The bucket name can include numbers, lowercase letters, uppercase letters, and hyphens, but it cannot start or end with hyphens (-)."
+  S3KeyPrefix:
+    Type: String
+    Default: lacework-csa-cfn-auto
+    MinLength: "1"
+    Description: "S3 key prefix for assets directory. Use this if you want to customize your deployment. The prefix can include numbers, lowercase letters, uppercase letters, hyphens (-), and forward slashes (/). For more information, see https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingMetadata.html."
+
+Resources:
+  LaceworkSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Lacework Secrets
+      Name: LaceworkSecrets
+      SecretString:
+        Fn::Join:
+          - ''
+          - - '{"AccessKeyID":"'
+            - !Ref LaceworkAccessKeyID
+            - '","SecretKey":"'
+            - !Ref LaceworkSecretKey
+            - '","LaceworkURL":"'
+            - !Ref LaceworkURL
+            - '","LaceworkAccount":"'
+            - !Select [ 0, !Split [ '.',  !Ref LaceworkURL ] ]
+            - '","ExternalID":"'
+            - !Select [ 4, !Split [ '-', !Select [ 2, !Split [ '/', !Ref AWS::StackId ] ] ] ]
+            - '","AccessToken": "0"'
+            - ',"TokenExpiry": 0 }'
+
+  SetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.7
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import threading
+          import boto3
+          import cfnresponse
+          import requests
+          import os
+          
+          logging.getLogger().setLevel(logging.INFO)
+          
+          def timeout(event, context):
+              logging.error('Execution is about to time out, sending failure response to CloudFormation')
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  delete(event, context)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, None)
+                  return
+              elif event['RequestType'] == 'Create':
+                  create(event, context)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, None)
+                  return
+              else:
+                  logging.warning('Unexpected RequestType! {}'.format(event['RequestType']))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+                  return
+          
+          def delete(event, context):
+              s3 = boto3.resource('s3')
+              try:
+                  lacework_bucket_name = os.environ['lacework_bucket']
+                  logging.info("Deleting cws s3 bucket {}".format(lacework_bucket_name))
+                  lacework_bucket = s3.Bucket(lacework_bucket_name)
+                  lacework_bucket.objects.delete()
+                  lacework_bucket.object_versions.delete()
+                  logging.info(lacework_bucket.delete())
+              except Exception as lacework_bucket_exception:
+                  logging.warning("Problem occurred while deleting s3 bucket: {}".format(lacework_bucket_exception))
+              
+              try:
+                  eks_audit_bucket_name = os.environ['eks_audit_bucket']
+                  logging.info("Deleting eks audit s3 bucket {}".format(eks_audit_bucket_name))
+                  eks_audit_bucket = s3.Bucket(eks_audit_bucket_name)
+                  eks_audit_bucket.objects.delete()
+                  eks_audit_bucket.object_versions.delete()
+                  logging.info(eks_audit_bucket.delete())
+              except Exception as eks_audit_bucket_exception:
+                  logging.warning("Problem occurred while deleting s3 bucket: {}".format(eks_audit_bucket_exception))
+          
+          def create(event, context):
+              # make sure we send a failure to CloudFormation if the function
+              # is going to timeout
+              timer = threading.Timer((context.get_remaining_time_in_millis()
+                        / 1000.00) - 0.5, timeout, args=[event, context])
+              timer.start()
+              print('Received event: %s' % json.dumps(event))
+              status = cfnresponse.SUCCESS
+              try:
+                  lacework_url = os.environ['lacework_url']
+                  lacework_secrets = os.environ['lacework_secrets']
+                  lacework_external_id = os.environ['lacework_external_id']
+                  access_token = setup_initial_access_token(lacework_url, lacework_secrets)
+                  enable_eks_cluster_logging()
+                  add_lw_cloud_account_for_sidekick('csa-agentless-'+lacework_external_id, lacework_url, access_token, lacework_secrets)
+              except Exception as e:
+                  logging.error('Exception: %s' % e, exc_info=True)
+                  status = cfnresponse.FAILED
+              finally:
+                  timer.cancel()
+                  cfnresponse.send(event, context, status, {}, None)
+          def setup_initial_access_token(lacework_url, lacework_secrets):
+              logging.info("lacework.setup_initial_access_token called.")
+              secret_client = boto3.client('secretsmanager')
+              secret_response = secret_client.get_secret_value(
+                  SecretId=lacework_secrets
+              )
+              if 'SecretString' not in secret_response:
+                raise Exception("SecretString not found in {}".format(lacework_secrets))
+          
+              secret_string_dict = json.loads(secret_response['SecretString'])
+              access_key_id = secret_string_dict['AccessKeyID']
+              secret_key = secret_string_dict['SecretKey']
+              access_token_response = send_lacework_api_access_token_request(lacework_url, access_key_id, secret_key)
+              if access_token_response.status_code == 201:
+                  payload_response = access_token_response.json()
+                  expires_at = payload_response['expiresAt']
+                  token = payload_response['token']
+                  secret_string_dict['AccessToken'] = token
+                  secret_string_dict['TokenExpiry'] = expires_at
+                  secret_client.update_secret(SecretId=lacework_secrets, SecretString=json.dumps(secret_string_dict))
+                  logging.info("New access token saved to secrets manager.")
+                  return token
+              else:
+                  raise Exception("Generate access key failure {} {}".format(access_token_response.status_code,access_token_response.text))
+          def add_lw_cloud_account_for_sidekick(integration_name, lacework_url, access_token, lacework_secrets, retry_count=0):
+              logging.info("lacework.add_lw_cloud_account_for_sidekick: retry {}".format(retry_count))
+
+              request_payload = '''
+              {{
+                "name": "{}",
+                "type": "AwsSidekick",
+                "enabled": 1,
+                "data": {{
+                  "scanFrequency": 24,
+                  "scanContainers": true,
+                  "scanHostVulnerabilities": true
+                }}
+              }}
+              '''.format(integration_name)
+              logging.info('Generate create account payload : {}'.format(request_payload))
+          
+              add_response = send_lacework_api_post_request(lacework_url, "api/v2/CloudAccounts", access_token,
+                                                            request_payload)
+              logging.info('API response code : {}'.format(add_response.status_code))
+              logging.info('API response : {}'.format(add_response.text))
+              if add_response.status_code == 201:
+                  add_response_dict = json.loads(add_response.text)
+                  data_dict = add_response_dict['data'];
+                  logging.info("API response data : {}".format(data_dict))
+                  secret_client = boto3.client('secretsmanager')
+                  secret_response = secret_client.get_secret_value(
+                      SecretId=lacework_secrets
+                  )
+                  if 'SecretString' not in secret_response:
+                    raise Exception("SecretString not found in {}".format(lacework_secrets))
+              
+                  secret_string_dict = json.loads(secret_response['SecretString'])
+                  secret_string_dict['IntgGuid'] = data_dict['intgGuid']
+                  secret_client.update_secret(SecretId=lacework_secrets, SecretString=json.dumps(secret_string_dict))
+                  logging.info("IntgGuid saved to secrets manager.")
+                  return True
+              else:
+                  logging.warning("API response error adding Config account {} {}".format(add_response.status_code,
+                                                                                         add_response.text))
+                  if retry_count < 3:
+                      retry_count += 1
+                      time.sleep(5)
+                      return add_lw_cloud_account_for_sidekick(integration_name, lacework_url, access_token, lacework_secrets, retry_count)
+                  return False
+          def enable_eks_cluster_logging():
+              logging.info("lacework.enable_eks_cluster_logging called.")
+              eks_client = boto3.client('eks')
+              eks_clusters = eks_client.list_clusters()
+              for cluster_name in eks_clusters['clusters']:
+                  logging.info("Enabling EKS cluster logging for {}".format(cluster_name))
+                  try:
+                      eks_client.update_cluster_config(
+                          name=cluster_name,
+                          logging={
+                              'clusterLogging': [
+                                  {
+                                      'types': [
+                                          'audit'
+                                      ],
+                                      'enabled': True
+                                  },
+                              ]
+                          }
+                      )
+                      logging.info("EKS cluster logging enabled.")
+                  except Exception as e:
+                      logging.warning("Exception: {}".format(e))
+          def send_lacework_api_access_token_request(lacework_url, access_key_id, secret_key):
+              logging.info("lacework.send_lacework_api_access_token_request: {}".format(lacework_url))
+              request_payload = '''
+                  {{
+                      "keyId": "{}",
+                      "expiryTime": 86400
+                  }}
+                  '''.format(access_key_id)
+              logging.debug('Generate access key payload : {}'.format(json.dumps(request_payload)))
+              try:
+                  return requests.post("https://" + lacework_url + "/api/v2/access/tokens",
+                                       headers={'X-LW-UAKS': secret_key, 'content-type': 'application/json'},
+                                        verify=True, data=request_payload)
+              except Exception as api_request_exception:
+                  raise api_request_exception
+          def send_lacework_api_post_request(lacework_url, api, access_token, request_payload):
+              logging.info("lacework.send_lacework_api_post_request: {} {} {}".format(lacework_url, api, request_payload))
+              try:
+                  return requests.post("https://" + lacework_url + "/" + api,
+                                           headers={'Authorization': access_token, 'content-type': 'application/json'},
+                                           verify=True, data=request_payload)
+              except Exception as api_request_exception:
+                  raise api_request_exception
+      Environment:
+        Variables:
+          lacework_url: !Ref LaceworkURL
+          lacework_secrets: !Ref LaceworkSecrets
+          lacework_external_id: "{{resolve:secretsmanager:LaceworkSecrets:SecretString:ExternalID}}"
+          lacework_bucket: "{{resolve:secretsmanager:LaceworkSecrets:SecretString:LaceworkAccount}}-laceworkcws-{{resolve:secretsmanager:LaceworkSecrets:SecretString:ExternalID}}"
+          eks_audit_bucket: "{{resolve:secretsmanager:LaceworkSecrets:SecretString:LaceworkAccount}}-lacework-eks-{{resolve:secretsmanager:LaceworkSecrets:SecretString:ExternalID}}"
+      Role: !GetAtt SetupFunctionRole.Arn
+
+  SetupFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: LaceworkS3BucketCleanup
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListObjects
+                  - s3:ListObjectsV2
+                  - s3:ListObjectVersions
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetObjectVersionAcl
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:DeleteBucket
+                Resource:
+                  - "arn:aws:s3:::*lacework*"
+                  - "arn:aws:s3:::*lacework*/*"
+        - PolicyName: StoreLaceworkSecrets
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:UpdateSecret
+                Resource:
+                  - !Ref LaceworkSecrets
+        - PolicyName: EKSClusterLogging
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:UpdateClusterConfig
+                  - eks:ListClusters
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:cluster/*"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  SetupFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt SetupFunction.Arn
+      Principal: events.amazonaws.com
+
+  SetupFunctionExecute:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken:
+        !GetAtt SetupFunction.Arn
+      
+  LaceworkAwsCtCfgAuto:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - SetupFunctionExecute
+      - LaceworkSecrets
+    Properties:
+      TemplateURL: >-
+        https://lacework-alliances.s3.us-west-2.amazonaws.com/lacework-csa-cfn-auto/templates/lacework-aws-ct-cfg-auto.yaml
+      Parameters:
+        ResourceNamePrefix: "{{resolve:secretsmanager:LaceworkSecrets:SecretString:LaceworkAccount}}"
+        ExternalID: "{{resolve:secretsmanager:LaceworkSecrets:SecretString:ExternalID}}"
+        AccessToken: "{{resolve:secretsmanager:LaceworkSecrets:SecretString:AccessToken}}"
+
+  LaceworkAgentlessAuto:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - SetupFunctionExecute
+      - LaceworkSecrets
+    Properties:
+      TemplateURL: >-
+        https://lacework-alliances.s3.us-west-2.amazonaws.com/lacework-csa-cfn-auto/templates/lacework-aws-agentless-direct-ng-auto.yaml
+      Parameters:
+        LaceworkURL: "{{resolve:secretsmanager:LaceworkSecrets:SecretString:LaceworkURL}}"
+        ResourceNamePrefix: "{{resolve:secretsmanager:LaceworkSecrets:SecretString:LaceworkAccount}}"
+        ResourceNameSuffix: "-agentless-cfn-msg"
+        ExternalId: "{{resolve:secretsmanager:LaceworkSecrets:SecretString:ExternalID}}"
+        AccessToken: "{{resolve:secretsmanager:LaceworkSecrets:SecretString:AccessToken}}"
